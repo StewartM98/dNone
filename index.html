@@ -9,9 +9,11 @@
     content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
   >
 
-  <!-- Add to Home Screen -> chrome-less kiosk mode.
-       REQUIRED for the full-screen 1290x2796 composition: in normal Safari the
-       address bar steals ~190px of height and you get side letterbox bars. -->
+  <!--
+    Add to Home Screen -> chrome-less kiosk mode.
+    REQUIRED for the full-screen 1290x2796 composition: in normal Safari the
+    address bar steals ~190px of height and you get side letterbox bars.
+  -->
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="fakeAR">
@@ -46,19 +48,28 @@
   <!-- 1. p5 - MUST stay on 1.x. p5 2.x reworked global mode and will break this. -->
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
 
-  <!-- 2. three.js r147 - the LAST release that ships examples/js as classic
-       script files (examples/js was deleted in r148). Do not bump this
-       version without porting the whole project to ES modules. -->
+  <!--
+    2. three.js r147 - the LAST release that ships examples/js as classic
+    script files (examples/js was deleted in r148). Do not bump this
+    version without porting the whole project to ES modules.
+  -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/GLTFLoader.js"></script>
 
-  <!-- optional: neutral image-based lighting, used only if the GLB has no lights -->
+  <!--
+    SkeletonUtils: lets duplicated objects keep their animation.
+    Optional - the code falls back to plain .clone() if absent, which is fine
+    for rigid objects but will not carry skinned animation.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/utils/SkeletonUtils.js"></script>
+
+  <!-- Optional: neutral image-based lighting, used only if the GLB has no lights. -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/environments/RoomEnvironment.js"></script>
 
-  <!-- optional: only if you exported with Draco compression -->
+  <!-- Optional: only if you exported with Draco compression. -->
   <!-- <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/loaders/DRACOLoader.js"></script> -->
 
-  <!-- 3. the sketch. sketch.js MUST be last. -->
+  <!-- 3. The sketch. sketch.js MUST be last. -->
   <script src="config.js"></script>
   <script src="blendercam.js"></script>
   <script src="camfeed.js"></script>
