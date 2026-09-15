@@ -1,8 +1,8 @@
 /* =============================================================================
    fakeAR — config.  The only file you normally edit.
 
-   Load order is fixed in index.html:
-     p5 -> three r147 -> GLTFLoader -> [RoomEnvironment] -> [DRACOLoader]
+   Load order in index.html:
+     p5 -> three r147 -> GLTFLoader -> [SkeletonUtils] -> [RoomEnvironment]
         -> config.js -> blendercam.js -> camfeed.js -> arlayer.js
         -> calibtouch.js -> sketch.js
 ============================================================================= */
@@ -30,8 +30,8 @@ function fwarn() {
 var CFG = {
 
   /* ----- assets ----------------------------------------------------------- */
-  // Netlify and GitHub Pages are CASE-SENSITIVE; macOS is not. 'Scene.glb'
-  // will work locally and 404 live. Keep it lowercase and exact.
+  // GitHub Pages is CASE-SENSITIVE; macOS is not. 'Scene.glb' will work
+  // locally and 404 live. Keep it lowercase and exact.
   GLB_URL: 'scene.glb',
 
   /* ----- composition ------------------------------------------------------ */
@@ -90,7 +90,16 @@ var CFG = {
   LOG: true,
 
   PLATE_CAPTURE: true,        // 3-finger tap saves the exact camera frame
-  CAL_TOUCH: true,           // touch nudging; turn on with ?cal=1
+
+  /* ----- placement tool --------------------------------------------------- */
+  // ON while you are placing objects. Set false to ship: the UI and all
+  // gestures disappear, but OBJ_OFFSETS and DUPLICATES still apply.
+  CAL_TOUCH: true,
+
+  // Show the readout + buttons. ?ui=0 hides them but keeps dragging alive
+  // (the "hide" button does the same thing at runtime).
+  CAL_UI: true,
+
   HIDE3D: false,              // hide the 3D layer; turn on with ?hide3d=1
 
   KEEP_AWAKE: true,           // request a screen wake lock after start
@@ -108,7 +117,7 @@ var CFG = {
      4. shiftX/Y   Only if the centre matches but the error is lopsided
                    left-vs-right or top-vs-bottom.
 
-   Tune live with ?cal=1 (mode button -> CAM) or via the URL overrides below.
+   Tune live with the "mode" button (-> CAM) or via the URL overrides below.
 
    Once fovScale settles, close the loop properly:
        true_focal = blender_focal / fovScale
@@ -125,24 +134,20 @@ var CAL = {
 };
 
 /* =============================================================================
-   OBJECT OFFSETS — fine per-object nudges.
+   OBJECT OFFSETS — per-object nudges for objects already in the GLB.
 
-   Your composition lives in Blender; this is only for the last few centimetres
-   of "that cloud wants to sit slightly left of the chimney". Applied to a
-   PARENT RIG wrapped around each object, so the AnimationMixer still drives the
-   object's own transform and the two never fight.
+   Applied to a PARENT RIG wrapped around each object, so the AnimationMixer
+   still drives the object's own transform and the two never fight.
 
-   Keys are TOP-LEVEL object names from Blender (exactly as in the Outliner —
-   the console prints the list on load). Values are metres in the GLB's Y-up
-   space. Populate by nudging in ?cal=1 and tapping "copy".
+   Keys are TOP-LEVEL object names from Blender (the console prints the list on
+   load). Values are metres in the GLB's Y-up space.
 
    Two accepted forms:
      "Name": [x, y, z]
      "Name": { pos:[x,y,z], quat:[x,y,z,w], scale:1 }
 
-   PREFERRED WORKFLOW: "copy" also prints the same deltas in BLENDER Z-up, so
-   you can type them into Blender, re-export, and empty this object again —
-   keeping Blender as the single source of truth.
+   "copy" also prints the same deltas in BLENDER Z-up, so you can type them into
+   Blender and re-export instead — keeping Blender as the single source of truth.
        blender_x =  glTF_x
        blender_y = -glTF_z
        blender_z =  glTF_y
@@ -151,6 +156,25 @@ var CAL = {
 var OBJ_OFFSETS = {
   // "Cloud.001": [0.04, -0.02, 0.00],
 };
+
+/* =============================================================================
+   DUPLICATES — extra copies of objects already in the GLB.
+
+   Created at load, so they behave exactly like the originals: same materials,
+   same animation clips. Each copy gets its own AnimationMixer.
+
+     src   : source object's name (must match a top-level GLB object)
+     pos   : the copy's rig position, glTF Y-up metres
+     quat  : optional extra rotation [x,y,z,w]
+     scale : optional uniform scale
+     tOff  : optional animation start offset in seconds, to stagger copies
+
+   Populate this by tapping "dup" in the placement tool, then "copy".
+============================================================================= */
+
+var DUPLICATES = [
+  // { src: "Cloud.001", pos: [1.20, 0.30, -0.50], scale: 0.85, tOff: 2.5 },
+];
 
 /* =============================================================================
    BLENDER_CAM — only read when USE_GLB_CAMERA is false, or when the GLB turns
@@ -202,18 +226,18 @@ var BLENDER_CAM = {
 
 /* =============================================================================
    URL OVERRIDES
-   Hosts cache aggressively, so redeploying for every 0.01 is miserable.
+   GitHub Pages caches for ~10 min, so redeploying for every tweak is painful.
    Tune live on the mounted phone by editing the URL:
 
-     ?cal=1                          touch nudging + readout + buttons
+     ?ui=0                           hide the panel (dragging still works)
+     ?cal=0                          disable the whole placement tool
      ?fov=1.03&yaw=0.4&pitch=-1.2    numeric camera nudges
      ?ref=0.5                        ghost the reference plate (needs REF_URL)
      ?hide3d=1&hint=0                clean camera view -> screenshot = plate
      ?glb=scene-v2                   load an alternate GLB
      ?aspect=0.4614                  try a different composition aspect
+     ?v=2                            cache-bust (any unused key works)
      ?hint=0  ?nolog=1  ?dpr=1
-
-   When you're happy, paste the values into CAL / OBJ_OFFSETS and deploy once.
 ============================================================================= */
 
 (function () {
@@ -241,6 +265,7 @@ var BLENDER_CAM = {
   if (q.has('hint'))   CFG.HINT      = (q.get('hint')   !== '0');
   if (q.has('nolog'))  CFG.LOG       = false;
   if (q.has('cal'))    CFG.CAL_TOUCH = (q.get('cal')    !== '0');
+  if (q.has('ui'))     CFG.CAL_UI    = (q.get('ui')     !== '0');
   if (q.has('hide3d')) CFG.HIDE3D    = (q.get('hide3d') !== '0');
 
   flog('URL overrides applied:', q.toString());
