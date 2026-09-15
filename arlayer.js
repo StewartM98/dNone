@@ -15,6 +15,7 @@ var ARLayer = {
   mixer: null,
   actions: [],
 
+  dupMixers: [],            // one AnimationMixer per duplicated object
   gltfScene: null,          // the loaded GLB root — calibtouch.js picks from this
   paused: false,
 
@@ -152,8 +153,8 @@ var ARLayer = {
         self.loadError = 'GLB failed: ' + url;
         fwarn(self.loadError, err);
         flog('checks:');
-        flog('  - filename matches EXACTLY (hosts are case-sensitive)');
-        flog('  - the file is at the site root, next to index.html');
+        flog('  - filename matches EXACTLY (GitHub Pages is case-sensitive)');
+        flog('  - the file is at the repo root, next to index.html');
         flog('  - the path has no leading slash');
         flog('  - it is a single self-contained .glb, not .gltf + .bin');
         flog('  - it is NOT in Git LFS (Pages serves the pointer file)');
@@ -252,7 +253,7 @@ var ARLayer = {
 
     if (glbCam) this._warnIfCameraAnimated(glbCam, clips);
 
-    /* ---- top-level names (use these as OBJ_OFFSETS keys) ---------------- */
+    /* ---- top-level names (use these as OBJ_OFFSETS / DUPLICATES keys) ---- */
     var tops = [];
     for (var t = 0; t < gltf.scene.children.length; t++) {
       var nm = gltf.scene.children[t];
@@ -355,15 +356,27 @@ var ARLayer = {
   },
 
   /* ------------------------------------------------------------------ frame */
+  // Duplicated objects each own a mixer, so pause/resume must reach those too.
   setPaused: function (p) {
     this.paused = !!p;
+
     for (var i = 0; i < this.actions.length; i++) {
       this.actions[i].paused = this.paused;
+    }
+
+    for (var d = 0; d < this.dupMixers.length; d++) {
+      var m = this.dupMixers[d];
+      var acts = m._actions || [];
+      for (var j = 0; j < acts.length; j++) acts[j].paused = this.paused;
     }
   },
 
   update: function (dt) {
-    if (this.mixer && !this.paused) this.mixer.update(dt);
+    if (this.paused) return;
+    if (this.mixer) this.mixer.update(dt);
+    for (var i = 0; i < this.dupMixers.length; i++) {
+      this.dupMixers[i].update(dt);
+    }
   },
 
   render: function () {
