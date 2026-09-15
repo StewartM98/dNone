@@ -1,25 +1,28 @@
 /* =============================================================================
-   fakeAR — drag objects into place
+   fakeAR — place objects, duplicate them, hide the UI
 
    OBJ mode (default):
      drag anywhere    -> move the SELECTED object, parallel to the screen
      tap on an object -> select it
-     "next"           -> cycle selection
-     pinch            -> move nearer / further (or scale, via "pinch" button)
+     pinch            -> nearer / further  (or scale, via the "pinch" button)
      two-finger twist -> rotate about the view axis
+     "next"           -> cycle selection
      "step"           -> drag sensitivity 1x / 0.25x / 0.05x
+     "dup"            -> duplicate the selection (offset so you can see it);
+                         the copy becomes the selection
+     "del"            -> delete the selected duplicate (originals are protected)
+     "hide"           -> collapse the UI to a small dot; tap the dot to restore
 
    CAM mode ("mode" button) — whole-composite alignment:
-     drag  -> yaw / pitch
-     pinch -> fovScale
-     twist -> roll
+     drag  -> yaw / pitch      pinch -> fovScale      twist -> roll
 
    3-finger tap -> capture calibration plate.
 
    Offsets live on a parent RIG wrapped around each top-level object, so the
    AnimationMixer keeps driving the object itself and the two never fight.
 
-   Runs with CAL_TOUCH off too, purely to apply OBJ_OFFSETS from config.js.
+   With CFG.CAL_TOUCH false this still runs, purely to apply OBJ_OFFSETS and
+   spawn DUPLICATES — so your placements persist in the shipped build.
 ============================================================================= */
 
 var CalTouch = {
@@ -37,17 +40,23 @@ var CalTouch = {
   on: false,
   mode: 'obj',
   ready: false,
+  hidden: false,
 
   _baseCal: null,
-  _list: [],                 // selectable top-level nodes
-  _rigs: {},                 // name -> rig Group
+  _list: [],                 // selectable top-level nodes (originals + copies)
+  _rigs: {},                 // key -> rig Group
+  _dups: [],                 // { key, src, node, rig, tOff }
+  _dupN: 0,
   _idx: -1,
   _sel: null,                // selected rig
-  _selName: '',
+  _selKey: '',
+  _selIsDup: false,
 
   _ui: null,
   _out: null,
+  _dot: null,
   _pauseBtn: null,
+  _delBtn: null,
 
   _g: null,                  // active gesture snapshot
   _moved: false,
@@ -81,7 +90,7 @@ var CalTouch = {
   _build: function () {
     this.ready = true;
 
-    // Wrap every top-level object that has geometry.
+    // Wrap every top-level object that has geometry under it.
     var root = ARLayer.gltfScene;
     this._list = [];
     for (var i = 0; i < root.children.length; i++) {
@@ -95,46 +104,53 @@ var CalTouch = {
       this._list.push(node);
     }
 
-    flog('draggable objects (' + this._list.length + '): ' +
+    flog('placeable objects (' + this._list.length + '): ' +
          this._list.map(function (n) { return n.name || '(unnamed)'; }).join(', '));
 
     this._applyStored();
+    this._spawnStoredDuplicates();
 
-    if (this.on) {
+    if (!this.on) return;
+
+    if (CFG.CAL_UI !== false) {
       this._makeUI();
       this._restore();
       if (this._list.length) this._pick(0);
       ARLayer.setPaused(true);          // much easier to place a still object
       if (this._pauseBtn) this._pauseBtn.textContent = 'play';
-      flog('DRAG MODE — drag anywhere to move "' + this._selName +
-           '". Tap an object to select it, or use "next".');
+      flog('PLACEMENT MODE — drag anywhere to move "' + this._selKey + '".');
+      flog('  "dup" duplicates it. "hide" collapses this UI. "copy" exports.');
+    } else {
+      this._restore();
+      if (this._list.length) this._pick(0);
     }
   },
 
   /* ------------------------------------------------------------- rig / apply */
-  _rigOf: function (node) {
+  _rigOf: function (node, key) {
     if (!node) return null;
     if (node.parent && node.parent.userData.__isRig) return node.parent;
 
+    var k = key || node.name || 'obj';
     var parent = node.parent;
     var g = new THREE.Group();
-    g.name = '__rig_' + (node.name || 'obj');
+    g.name = '__rig_' + k;
     g.userData.__isRig = true;
-    g.userData.__for = node.name || '';
+    g.userData.__key = k;
     parent.add(g);
     g.add(node);                        // reparent, preserving local transform
-    if (node.name) this._rigs[node.name] = g;
+    this._rigs[k] = g;
     return g;
   },
 
-  _rigByName: function (name) {
-    if (this._rigs[name]) return this._rigs[name];
+  _rigByKey: function (key) {
+    if (this._rigs[key]) return this._rigs[key];
     var root = ARLayer.gltfScene;
     if (!root) return null;
     for (var i = 0; i < root.children.length; i++) {
       var c = root.children[i];
-      if (c.userData.__isRig && c.userData.__for === name) return c;
-      if (c.name === name) return this._rigOf(c);
+      if (c.userData.__isRig && c.userData.__key === key) return c;
+      if (c.name === key) return this._rigOf(c);
     }
     return null;
   },
@@ -144,8 +160,12 @@ var CalTouch = {
     var n = 0;
     for (var name in OBJ_OFFSETS) {
       if (!OBJ_OFFSETS.hasOwnProperty(name)) continue;
-      var rig = this._rigByName(name);
-      if (!rig) { fwarn('OBJ_OFFSETS: no object named "' + name + '"'); continue; }
+      var rig = this._rigByKey(name);
+      if (!rig) {
+        fwarn('OBJ_OFFSETS: no object named "' + name +
+              '" — check the "placeable objects" list above');
+        continue;
+      }
       this._setRig(rig, OBJ_OFFSETS[name]);
       n++;
     }
@@ -167,8 +187,241 @@ var CalTouch = {
     if (!this._list.length) return;
     this._idx = ((i % this._list.length) + this._list.length) % this._list.length;
     var node = this._list[this._idx];
-    this._sel = this._rigOf(node);
-    this._selName = node.name || '(unnamed)';
+    var rig = (node.parent && node.parent.userData.__isRig)
+            ? node.parent : this._rigOf(node);
+    this._sel = rig;
+    this._selKey = rig.userData.__key;
+    this._selIsDup = !!node.userData.__isDup;
+    if (this._delBtn) this._delBtn.style.opacity = this._selIsDup ? '1' : '0.35';
+    this._paint();
+  },
+
+  _selectByNode: function (node) {
+    for (var i = 0; i < this._list.length; i++) {
+      if (this._list[i] === node) { this._pick(i); return true; }
+    }
+    return false;
+  },
+
+  _sourceOf: function (name) {
+    for (var i = 0; i < this._list.length; i++) {
+      if (this._list[i].name === name && !this._list[i].userData.__isDup) {
+        return this._list[i];
+      }
+    }
+    return null;
+  },
+
+  /* ---------------------------------------------------------- DUPLICATION */
+
+  /* Clone a top-level object, wrap it in its own rig, and bind the same
+     animation clips to the copy so it moves exactly like the original.
+     SkeletonUtils.clone() is used when available (required for skinned
+     meshes); plain .clone(true) is fine for rigid objects. */
+  duplicate: function (srcNode, opts) {
+    if (!srcNode) return null;
+    opts = opts || {};
+
+    var cloner = (THREE.SkeletonUtils && THREE.SkeletonUtils.clone)
+               ? THREE.SkeletonUtils.clone
+               : function (o) { return o.clone(true); };
+
+    var srcName = srcNode.name || 'obj';
+    var copy = cloner(srcNode);
+
+    this._dupN++;
+    var key = srcName + '__copy' + this._dupN;
+    copy.name = key;
+    copy.userData.__isDup = true;
+    copy.userData.__src = srcName;
+
+    copy.traverse(function (o) {
+      if (o.isMesh || o.isSkinnedMesh) o.frustumCulled = false;
+    });
+
+    // Same parent as the source's rig, so both share one coordinate space.
+    var srcRig = (srcNode.parent && srcNode.parent.userData.__isRig)
+               ? srcNode.parent : null;
+    var host = srcRig ? srcRig.parent : ARLayer.gltfScene;
+    host.add(copy);
+
+    var rig = this._rigOf(copy, key);
+
+    // Start from the source rig's transform, then apply the requested offset.
+    if (srcRig) {
+      rig.position.copy(srcRig.position);
+      rig.quaternion.copy(srcRig.quaternion);
+      rig.scale.copy(srcRig.scale);
+    }
+    if (opts.pos) {
+      rig.position.x += opts.pos[0] || 0;
+      rig.position.y += opts.pos[1] || 0;
+      rig.position.z += opts.pos[2] || 0;
+    }
+    if (opts.quat) {
+      rig.quaternion.multiply(new THREE.Quaternion(
+        opts.quat[0], opts.quat[1], opts.quat[2], opts.quat[3]));
+    }
+    if (typeof opts.scale === 'number') rig.scale.multiplyScalar(opts.scale);
+
+    var tOff = (typeof opts.tOff === 'number') ? opts.tOff : 0;
+    this._bindClips(srcNode, copy, tOff);
+
+    this._dups.push({ key: key, src: srcName, node: copy, rig: rig, tOff: tOff });
+    this._list.push(copy);
+
+    return { key: key, node: copy, rig: rig };
+  },
+
+  /* Re-target every track that referenced the source subtree onto the copy.
+     Each copy gets its OWN mixer: names repeat across copies, and a single
+     mixer resolves bindings by searching from its root, which would be
+     ambiguous. A per-copy mixer removes the ambiguity entirely, and lets each
+     copy hold an independent time offset. */
+  _bindClips: function (srcNode, copy, tOff) {
+    if (!ARLayer.mixer || !ARLayer.actions.length) return;
+
+    var srcNames = {};
+    srcNode.traverse(function (o) { if (o.name) srcNames[o.name] = true; });
+
+    var clips = [];
+    for (var i = 0; i < ARLayer.actions.length; i++) {
+      var c = ARLayer.actions[i].getClip();
+      if (clips.indexOf(c) === -1) clips.push(c);
+    }
+
+    var dupMixer = new THREE.AnimationMixer(copy);
+    var bound = 0;
+
+    for (var k = 0; k < clips.length; k++) {
+      var clip = clips[k];
+      var tracks = [];
+
+      for (var t = 0; t < clip.tracks.length; t++) {
+        var tr = clip.tracks[t];
+        var nodeName = tr.name.split('.')[0];
+
+        if (nodeName === srcNode.name) {
+          // Track targets the root itself -> retarget to the copy's new name.
+          var c2 = tr.clone();
+          c2.name = copy.name + tr.name.substring(nodeName.length);
+          tracks.push(c2);
+        } else if (srcNames[nodeName]) {
+          tracks.push(tr.clone());      // child names are preserved by clone()
+        }
+      }
+      if (!tracks.length) continue;
+
+      var sub = new THREE.AnimationClip(clip.name + '__' + copy.name,
+                                        clip.duration, tracks);
+      var a = dupMixer.clipAction(sub);
+      a.setLoop(THREE.LoopRepeat, Infinity);
+      a.clampWhenFinished = false;
+      a.play();
+      a.paused = ARLayer.paused;
+      bound++;
+    }
+
+    if (!bound) return;
+
+    if (tOff) dupMixer.setTime(tOff);    // stagger this copy's loop
+
+    ARLayer.dupMixers.push(dupMixer);
+    copy.userData.__mixer = dupMixer;
+    flog('bound ' + bound + ' clip(s) to ' + copy.name +
+         (tOff ? '  (offset ' + tOff.toFixed(2) + 's)' : ''));
+  },
+
+  _spawnStoredDuplicates: function () {
+    if (typeof DUPLICATES === 'undefined' || !DUPLICATES.length) return;
+    var n = 0;
+    for (var i = 0; i < DUPLICATES.length; i++) {
+      var d = DUPLICATES[i];
+      var src = this._sourceOf(d.src);
+      if (!src) {
+        fwarn('DUPLICATES: no source object named "' + d.src + '"');
+        continue;
+      }
+      // pos in DUPLICATES is the copy's ABSOLUTE rig position, so create the
+      // copy with no offset and then write the transform directly.
+      var made = this.duplicate(src, { tOff: d.tOff });
+      if (made) this._setRig(made.rig, d);
+      n++;
+    }
+    if (n) flog('spawned ' + n + ' duplicate(s) from config');
+  },
+
+  _dupSelected: function () {
+    if (!this._sel) return;
+    var node = this._sel.children[0];
+    if (!node) return;
+
+    // Offset by ~12% of the frame width at the object's depth, so the copy is
+    // clearly visible rather than hidden exactly behind the original.
+    var d = this._sel.getWorldPosition(new THREE.Vector3())
+              .distanceTo(ARLayer.cam.position);
+    var off = 2 * d * Math.tan(ARLayer.cam.fov * Math.PI / 360) * 0.12;
+    var right = new THREE.Vector3(1, 0, 0)
+                  .applyQuaternion(ARLayer.cam.quaternion)
+                  .multiplyScalar(off);
+
+    // Always clone from the ORIGINAL, never from a copy, so clip binding stays
+    // clean no matter how many generations deep you go.
+    var src = node.userData.__isDup
+            ? (this._sourceOf(node.userData.__src) || node)
+            : node;
+
+    var made = this.duplicate(src, {});
+    if (!made) return;
+
+    // Start from the CURRENT selection's transform, then push it sideways.
+    made.rig.position.copy(this._sel.position);
+    made.rig.quaternion.copy(this._sel.quaternion);
+    made.rig.scale.copy(this._sel.scale);
+
+    var o = new THREE.Vector3(0, 0, 0);
+    var pInv = new THREE.Matrix4().copy(made.rig.parent.matrixWorld).invert();
+    o.applyMatrix4(pInv);
+    made.rig.position.add(right.applyMatrix4(pInv).sub(o));
+
+    this._selectByNode(made.node);
+    flog('duplicated -> ' + made.key + '   (objects: ' + this._list.length + ')');
+    this._save();
+  },
+
+  deleteSelected: function () {
+    if (!this._sel || !this._selIsDup) {
+      flog('only duplicates can be deleted — originals are protected');
+      return;
+    }
+
+    var key = this._selKey;
+    var rig = this._sel;
+    var node = rig.children[0];
+
+    if (node && node.userData.__mixer) {
+      var m = node.userData.__mixer;
+      m.stopAllAction();
+      var mi = ARLayer.dupMixers.indexOf(m);
+      if (mi >= 0) ARLayer.dupMixers.splice(mi, 1);
+    }
+
+    var li = this._list.indexOf(node);
+    if (li >= 0) this._list.splice(li, 1);
+    for (var d = 0; d < this._dups.length; d++) {
+      if (this._dups[d].key === key) { this._dups.splice(d, 1); break; }
+    }
+    delete this._rigs[key];
+
+    if (rig.parent) rig.parent.remove(rig);
+    // Geometries and materials are shared with the original — do NOT dispose.
+
+    flog('deleted ' + key);
+    this._sel = null;
+    this._selKey = '';
+    this._selIsDup = false;
+    if (this._list.length) this._pick(Math.max(0, this._idx - 1));
+    this._save();
     this._paint();
   },
 
@@ -181,6 +434,7 @@ var CalTouch = {
     function mine(e) {
       if (typeof plateEl !== 'undefined' && plateEl) return false;
       if (self._ui && self._ui.contains(e.target)) return false;
+      if (self._dot && self._dot.contains(e.target)) return false;
       return true;
     }
 
@@ -207,7 +461,7 @@ var CalTouch = {
 
     function end(e) {
       if (!self.on) return;
-      if (e.touches && e.touches.length > 0) {   // a finger lifted, others remain
+      if (e.touches && e.touches.length > 0) {   // one lifted, others remain
         self._g = null;
         self._start(e.touches);
         return;
@@ -225,6 +479,7 @@ var CalTouch = {
     window.addEventListener('mousedown', function (e) {
       if (!self.on) return;
       if (self._ui && self._ui.contains(e.target)) return;
+      if (self._dot && self._dot.contains(e.target)) return;
       if (!CamFeed.ready && !CamFeed.starting) {
         if (typeof begin === 'function') begin();
         return;
@@ -248,15 +503,17 @@ var CalTouch = {
       self._g = null; self._save(); self._paint();
     }, { passive: false });
 
-    // Arrow keys nudge on desktop
     window.addEventListener('keydown', function (e) {
-      if (!self.on || self.mode !== 'obj' || !self._sel) return;
-      var k = e.key, px = 4 * self._step();
-      var d = null;
-      if (k === 'ArrowLeft')  d = [-px, 0];
-      if (k === 'ArrowRight') d = [ px, 0];
-      if (k === 'ArrowUp')    d = [0, -px];
-      if (k === 'ArrowDown')  d = [0,  px];
+      if (!self.on) return;
+      if (e.key === 'd' || e.key === 'D') { self._dupSelected(); self._paint(); return; }
+      if (e.key === 'h' || e.key === 'H') { self.setHidden(!self.hidden); return; }
+      if (e.key === 'n' || e.key === 'N') { self._pick(self._idx + 1); return; }
+      if (self.mode !== 'obj' || !self._sel) return;
+      var px = 4 * self._step(), d = null;
+      if (e.key === 'ArrowLeft')  d = [-px, 0];
+      if (e.key === 'ArrowRight') d = [ px, 0];
+      if (e.key === 'ArrowUp')    d = [0, -px];
+      if (e.key === 'ArrowDown')  d = [0,  px];
       if (!d) return;
       e.preventDefault();
       self._start([{ clientX: 0, clientY: 0 }]);
@@ -284,7 +541,8 @@ var CalTouch = {
     this._g = g;
   },
 
-  // Freeze everything at gesture start so each frame is computed absolutely.
+  // Freeze everything at gesture start so each frame is computed absolutely
+  // from that snapshot — no accumulation, no drift.
   _snap: function (g) {
     var rig = this._sel;
     rig.parent.updateWorldMatrix(true, false);
@@ -329,7 +587,7 @@ var CalTouch = {
   },
 
   /* Screen pixels -> world translation at the object's depth.
-     No raycasting, so this works no matter where you touch. */
+     No raycasting, so this works wherever on screen you touch. */
   _move: function (px, py) {
     var g = this._g;
     if (!g || !this._sel || !g.pos0) return;
@@ -342,7 +600,7 @@ var CalTouch = {
     var right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
     var up    = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
 
-    // world delta -> parent-local delta (handles parent rotation/scale)
+    // world delta -> parent-local delta (handles parent rotation and scale)
     var wd = right.multiplyScalar(px * k).add(up.multiplyScalar(-py * k));
     var o = new THREE.Vector3(0, 0, 0).applyMatrix4(g.pInv);
     var ld = wd.applyMatrix4(g.pInv).sub(o);
@@ -351,12 +609,12 @@ var CalTouch = {
     this._paint();
   },
 
-  /* pinch: r>1 = fingers spread */
+  /* pinch: r > 1 means fingers spread apart */
   _zoom: function (r, twist) {
     var g = this._g;
     if (!g) return;
     var f = this._step();
-    var rf = 1 + (r - 1) * f;
+    var rf = 1 + (r - 1) * f;          // damp toward 1 when step < 1
 
     if (this.mode === 'cam') {
       CAL.fovScale = Math.max(0.25, Math.min(4, g.cal.fovScale / rf));
@@ -369,8 +627,8 @@ var CalTouch = {
     if (!this._sel || !g.pos0) return;
 
     if (this.pinchMode === 'scale') {
-      this._sel.scale.copy(g.scale0).multiplyScalar(
-        Math.max(0.05, Math.min(20, rf)));
+      this._sel.scale.copy(g.scale0)
+        .multiplyScalar(Math.max(0.05, Math.min(20, rf)));
     } else {
       // Along the camera ray: grows/shrinks but stays put on screen.
       var newD = Math.max(0.05, g.dist0 / rf);
@@ -401,7 +659,7 @@ var CalTouch = {
     this._paint();
   },
 
-  /* Tap-to-select. Optional convenience; dragging never depends on it. */
+  /* Tap-to-select. Convenience only — dragging never depends on it. */
   _hitTest: function (p) {
     if (!ARLayer.gltfScene || !this._list.length) return;
     var r = ARLayer.renderer.domElement.getBoundingClientRect();
@@ -411,20 +669,40 @@ var CalTouch = {
     var hits = this._ray.intersectObject(ARLayer.gltfScene, true);
     if (!hits.length) return;
 
-    // Walk up to the top-level node and match it in the list.
     var n = hits[0].object;
     while (n && n.parent) {
-      for (var i = 0; i < this._list.length; i++) {
-        if (this._list[i] === n) { this._pick(i); return; }
-      }
+      if (this._selectByNode(n)) return;
       n = n.parent;
     }
   },
 
   /* --------------------------------------------------------------------- UI */
+  setHidden: function (h) {
+    this.hidden = !!h;
+    if (this._ui) this._ui.style.display = this.hidden ? 'none' : 'block';
+    if (this._dot) this._dot.style.display = this.hidden ? 'block' : 'none';
+  },
+
   _makeUI: function () {
     var self = this;
 
+    /* ---- restore dot: always built, only visible while hidden ---- */
+    var dot = document.createElement('div');
+    dot.style.cssText =
+      'position:fixed;z-index:22;display:none;' +
+      'right:calc(6px + env(safe-area-inset-right));' +
+      'top:calc(6px + env(safe-area-inset-top));' +
+      'width:28px;height:28px;border-radius:50%;' +
+      'background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.22);' +
+      'pointer-events:auto;';
+    dot.addEventListener('touchstart', function (e) { e.stopPropagation(); }, true);
+    dot.addEventListener('click', function (e) {
+      e.stopPropagation(); e.preventDefault(); self.setHidden(false);
+    });
+    document.body.appendChild(dot);
+    this._dot = dot;
+
+    /* ---- panel ---- */
     var wrap = document.createElement('div');
     wrap.style.cssText =
       'position:fixed;left:0;right:0;top:0;z-index:20;pointer-events:none;' +
@@ -445,10 +723,6 @@ var CalTouch = {
       b.textContent = label;
       b.style.cssText =
         '-webkit-appearance:none;appearance:none;font:600 12px/1 inherit;' +
-        'background:rgba(22,26,34,.9);color:#eaf0f8;border:1px solid #3d4characters' +
-        '';
-      b.style.cssText =
-        '-webkit-appearance:none;appearance:none;font:600 12px/1 inherit;' +
         'background:rgba(22,26,34,.9);color:#eaf0f8;border:1px solid #3d4757;' +
         'border-radius:7px;padding:10px 13px;';
       b.addEventListener('touchstart', function (e) { e.stopPropagation(); }, true);
@@ -460,6 +734,10 @@ var CalTouch = {
     }
 
     btn('next', function () { self._pick(self._idx + 1); });
+    btn('dup',  function () { self._dupSelected(); });
+
+    this._delBtn = btn('del', function () { self.deleteSelected(); });
+    this._delBtn.style.opacity = '0.35';
 
     btn('step', function () {
       self._stepIdx = (self._stepIdx + 1) % self.STEPS.length;
@@ -479,18 +757,12 @@ var CalTouch = {
     });
 
     btn('copy', function () { self._copy(); });
+    btn('hide', function () { self.setHidden(true); });
 
     btn('reset', function () {
-      for (var k in self._baseCal) CAL[k] = self._baseCal[k];
-      for (var n in self._rigs) {
-        self._rigs[n].position.set(0, 0, 0);
-        self._rigs[n].quaternion.identity();
-        self._rigs[n].scale.set(1, 1, 1);
-      }
-      self._applyStored();
-      ARLayer.applyCalibration();
       try { localStorage.removeItem('fakeAR.cal'); } catch (e) {}
-      flog('reset');
+      flog('reset — reloading to config.js values');
+      location.reload();
     });
 
     wrap.appendChild(row);
@@ -505,19 +777,21 @@ var CalTouch = {
     var L = [];
 
     if (this.mode === 'obj') {
-      L.push('DRAG  ' + (this._selName || '(none)') +
+      L.push('PLACE  ' + (this._selKey || '(none)') +
+             (this._selIsDup ? ' [copy]' : '') +
              '   ' + (this._idx + 1) + '/' + this._list.length +
              '   step ' + this._step() + 'x   pinch=' + this.pinchMode);
       if (this._sel) {
         var p = this._sel.position;
         var b = BL.toBlenderDelta(p.x, p.y, p.z);
-        L.push('glTF ' + f(p.x) + ' ' + f(p.y) + ' ' + f(p.z));
+        L.push('glTF ' + f(p.x) + ' ' + f(p.y) + ' ' + f(p.z) +
+               '   scl ' + this._sel.scale.x.toFixed(3));
         L.push('bldr ' + f(b.x) + ' ' + f(b.y) + ' ' + f(b.z));
       } else {
-        L.push('no draggable objects found — check the console');
+        L.push('no placeable objects found — check the console');
       }
     } else {
-      L.push('CAM   fov ' + f(CAL.fovScale) + ' -> ' +
+      L.push('CAM    fov ' + f(CAL.fovScale) + ' -> ' +
              ARLayer.cam.fov.toFixed(2) + 'deg  (' +
              (18 / Math.tan(ARLayer.cam.fov * Math.PI / 360)).toFixed(1) + 'mm)');
       L.push('yaw ' + f(CAL.yaw) + '  pitch ' + f(CAL.pitch) +
@@ -530,23 +804,27 @@ var CalTouch = {
   _dump: function () {
     var r3 = function (v) { return Math.round(v * 1000) / 1000; };
     var r4 = function (v) { return Math.round(v * 10000) / 10000; };
+
     var out = { CAL: {
       fovScale: r3(CAL.fovScale), yaw: r3(CAL.yaw), pitch: r3(CAL.pitch),
       roll: r3(CAL.roll), shiftX: r3(CAL.shiftX), shiftY: r3(CAL.shiftY)
-    }, OBJ: {} };
+    }, OBJ: {}, DUP: [] };
 
-    for (var n in this._rigs) {
-      var rig = this._rigs[n];
+    // originals
+    for (var k in this._rigs) {
+      var rig = this._rigs[k];
+      var node = rig.children[0];
+      if (!node || node.userData.__isDup) continue;
+
       var moved = rig.position.lengthSq() > 1e-8;
       var rot = Math.abs(rig.quaternion.w) < 0.99999;
       var scl = Math.abs(rig.scale.x - 1) > 1e-4;
       if (!moved && !rot && !scl) continue;
 
-      var name = rig.userData.__for;
       if (!rot && !scl) {
-        out.OBJ[name] = [r3(rig.position.x), r3(rig.position.y), r3(rig.position.z)];
+        out.OBJ[k] = [r3(rig.position.x), r3(rig.position.y), r3(rig.position.z)];
       } else {
-        out.OBJ[name] = {
+        out.OBJ[k] = {
           pos: [r3(rig.position.x), r3(rig.position.y), r3(rig.position.z)],
           quat: [r4(rig.quaternion.x), r4(rig.quaternion.y),
                  r4(rig.quaternion.z), r4(rig.quaternion.w)],
@@ -554,6 +832,22 @@ var CalTouch = {
         };
       }
     }
+
+    // duplicates — pos is the copy's absolute rig position
+    for (var d = 0; d < this._dups.length; d++) {
+      var dup = this._dups[d];
+      var r = dup.rig;
+      var e = { src: dup.src,
+                pos: [r3(r.position.x), r3(r.position.y), r3(r.position.z)] };
+      if (Math.abs(r.quaternion.w) < 0.99999) {
+        e.quat = [r4(r.quaternion.x), r4(r.quaternion.y),
+                  r4(r.quaternion.z), r4(r.quaternion.w)];
+      }
+      if (Math.abs(r.scale.x - 1) > 1e-4) e.scale = r3(r.scale.x);
+      if (dup.tOff) e.tOff = r3(dup.tOff);
+      out.DUP.push(e);
+    }
+
     return out;
   },
 
@@ -569,26 +863,39 @@ var CalTouch = {
       '  shiftX:   ' + d.CAL.shiftX + ',\n' +
       '  shiftY:   ' + d.CAL.shiftY + '\n};\n\n';
 
-    var any = false, o = 'var OBJ_OFFSETS = {\n';
+    var anyObj = false, o = 'var OBJ_OFFSETS = {\n';
     for (var name in d.OBJ) {
-      any = true;
+      anyObj = true;
       o += '  "' + name + '": ' + JSON.stringify(d.OBJ[name]) + ',\n';
     }
-    o += '};';
-    s += any ? o : 'var OBJ_OFFSETS = {};   // nothing moved';
+    o += '};\n\n';
+    s += anyObj ? o : 'var OBJ_OFFSETS = {};\n\n';
 
-    if (any) {
-      s += '\n\n/* --- same deltas in BLENDER (Z-up) metres: add to each\n' +
-           '   object\'s Location, re-export, then empty OBJ_OFFSETS ---\n';
+    var u = 'var DUPLICATES = [\n';
+    for (var i = 0; i < d.DUP.length; i++) {
+      u += '  ' + JSON.stringify(d.DUP[i]) + ',\n';
+    }
+    u += '];';
+    s += u;
+
+    if (anyObj) {
+      s += '\n\n/* --- original-object deltas in BLENDER (Z-up) metres.\n' +
+           '   Add these to each object\'s Location, re-export, then empty\n' +
+           '   OBJ_OFFSETS to keep Blender as the single source of truth. ---\n';
       for (var nm in this._rigs) {
-        var p = this._rigs[nm].position;
-        if (p.lengthSq() < 1e-8) continue;
-        var b = BL.toBlenderDelta(p.x, p.y, p.z);
-        s += '   ' + this._rigs[nm].userData.__for + ':  X ' + r3(b.x) +
-             '   Y ' + r3(b.y) + '   Z ' + r3(b.z) + '\n';
+        var rg = this._rigs[nm];
+        var nd = rg.children[0];
+        if (!nd || nd.userData.__isDup) continue;
+        if (rg.position.lengthSq() < 1e-8) continue;
+        var bb = BL.toBlenderDelta(rg.position.x, rg.position.y, rg.position.z);
+        s += '   ' + nm + ':  X ' + r3(bb.x) + '   Y ' + r3(bb.y) +
+             '   Z ' + r3(bb.z) + '\n';
       }
       s += '*/';
     }
+
+    s += '\n\n// Blender focal implied by fovScale (Sensor Fit Vertical, Size 36): ' +
+         (18 / Math.tan(ARLayer.cam.fov * Math.PI / 360)).toFixed(2) + ' mm';
 
     flog('\n' + s);
     if (navigator.clipboard) {
@@ -599,6 +906,8 @@ var CalTouch = {
     if (this._out) this._out.textContent = s;
   },
 
+  // Only written while the tool is on, so a stale localStorage can never
+  // affect the shipped build.
   _save: function () {
     if (!this.on) return;
     try { localStorage.setItem('fakeAR.cal', JSON.stringify(this._dump())); } catch (e) {}
@@ -609,15 +918,39 @@ var CalTouch = {
     var raw = null;
     try { raw = localStorage.getItem('fakeAR.cal'); } catch (e) {}
     if (!raw) return;
+
     try {
       var d = JSON.parse(raw);
+
       if (d.CAL) for (var k in d.CAL) if (k in CAL) CAL[k] = d.CAL[k];
+
       if (d.OBJ) for (var n in d.OBJ) {
-        var rig = this._rigByName(n);
+        var rig = this._rigByKey(n);
         if (rig) this._setRig(rig, d.OBJ[n]);
       }
+
+      // Replace config duplicates with the saved set, so the count is right.
+      if (d.DUP) {
+        while (this._dups.length) {
+          this._sel = this._dups[0].rig;
+          this._selKey = this._dups[0].key;
+          this._selIsDup = true;
+          this.deleteSelected();
+        }
+        for (var i = 0; i < d.DUP.length; i++) {
+          var e = d.DUP[i];
+          var src = this._sourceOf(e.src);
+          if (!src) continue;
+          var made = this.duplicate(src, { tOff: e.tOff });
+          if (made) this._setRig(made.rig, e);
+        }
+        if (d.DUP.length) flog('restored ' + d.DUP.length + ' duplicate(s)');
+      }
+
       ARLayer.applyCalibration();
-      flog('restored previous nudges — "reset" to discard');
-    } catch (e) {}
+      flog('restored previous session from localStorage — "reset" to discard');
+    } catch (e) {
+      fwarn('could not restore session', e);
+    }
   }
 };
